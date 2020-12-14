@@ -13,6 +13,9 @@ object TaskActor {
         context.log.info(s"Handling CheckHealth request for Task ${context.self.path}")
         replyTo ! TaskResponseProtocol.TaskIsHealthy
         Behaviors.same
+
+      case TaskRequestProtocol.Stop =>
+        Behaviors.stopped
     }
   }
 }

@@ -8,4 +8,5 @@ object TaskRequestProtocol {
 
   final case class CheckHealth(replyTo: ActorRef[TaskResponseProtocol.Response]) extends Request
 
+  final case object Stop extends Request
 }

@@ -54,13 +54,22 @@ object TaskManagerActor {
     Behaviors.receive { (context, message) =>
       message match {
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
+
+          // Stop any existing deployment
+          // val newRouters = cleanUp(routers)(context)
+          // Thread.sleep(3000) // TODO: Nobody wants to Thread.sleep, we should check for the Actors to be stopped
+          val newRouters = routers
+
+          // Build the Service Deployment Graph
           buildServiceDeploymentGraph(services) match {
             case newGraph if newGraph.isCyclic =>
+              // Reject the deployment request if the Graph is cyclic
               context.log.error("The service deployment is cyclic, stopping")
               replyTo ! TaskManagerResponseProtocol.DeploymentError
-              manageRequests(taskResponseMapper, newGraph, routers)
+              manageRequests(taskResponseMapper, newGraph, newRouters)
 
             case newGraph =>
+              // If the Graph is acyclic then we can spawn the Tasks
               spawnTasks(newGraph, taskResponseMapper, replyTo)(context)
           }
 
@@ -70,7 +79,7 @@ object TaskManagerActor {
               // Send a CheckHealth message to ALL routers
               broadcastHealthCheck(topology.map(_.value), routers, taskResponseMapper)
 
-              // Check that ALL Tasks reply with a TaskIsHealthy message
+              // Check that ALL Routers reply with a TaskIsHealthy message
               tasksHealthChecking(taskResponseMapper, g, routers, topology.size, replyTo)
 
             case Failure(e) =>
@@ -267,14 +276,14 @@ object TaskManagerActor {
 
                 case msg =>
                   context.log.error(s"Unexpected message received while waiting for a Task health check status ($msg)")
-                  cleanUp(routers, context)
+                  cleanUp(routers)(context)
                   replyTo ! TaskManagerResponseProtocol.DeploymentError
                   manageRequests(taskResponseMapper, Graph(), Map())
-             }
+              }
 
             case TaskManagerRequestProtocol.HealthCheckTimeout =>
               context.log.error("A HealthCheck Timeout has been received while waiting for a spawned Task")
-              cleanUp(routers, context)
+              cleanUp(routers)(context)
               replyTo ! TaskManagerResponseProtocol.DeploymentError
               manageRequests(taskResponseMapper, Graph(), Map())
           }
@@ -302,14 +311,18 @@ object TaskManagerActor {
    * @param routers A Map containing the ActorRef of each Task router
    * @param context An actor context
    */
-  def cleanUp(routers: Map[String, ActorRef[TaskRequestProtocol.Request]], context: ActorContext[TaskManagerRequestProtocol.Request]): Unit = {
+  def cleanUp(routers: Map[String, ActorRef[TaskRequestProtocol.Request]])
+             (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Map[String, ActorRef[TaskRequestProtocol.Request]] = {
     context.log.info("Stopping all Tasks ...")
+
     routers
       .foreach {
-        case (taskName, task) =>
-          context.log.info(s"Stopping Task $task")
-          context.stop(task)
+        case (taskName, route) =>
+          context.log.info(s"Stopping Task $route")
+          route ! TaskRequestProtocol.Stop
       }
+
+    Map.empty[String, ActorRef[TaskRequestProtocol.Request]]
   }
 
   /**
