@@ -14,9 +14,11 @@ import scala.util.{Failure, Success, Try}
 
 object TaskManagerActor {
 
-  class TaskNotDeployedException(message: String) extends Exception(message)
+  case class TaskNotDeployedException(message: String) extends Exception(message)
 
-  class InvalidServiceSpecificationException(message: String) extends Exception(message)
+  case class InvalidServiceSpecificationException(message: String) extends Exception(message)
+
+  case class EmptyServiceSpecificationException(message: String) extends Exception(message)
 
   /*
    * A Task represents a Service and it is handled through Akka actors
@@ -64,7 +66,7 @@ object TaskManagerActor {
           }
 
         case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
-          getTopology(g)(context) match {
+          getTopology(g) match {
             case Success(topology) =>
               // Send a CheckHealth message to each Task Router
               for {
@@ -171,7 +173,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @param g The Graph containing the Nodes for the services to deploy
    */
-  def createEdges(services: List[ServiceDeployment], g: Graph[Task, DiEdge]): Unit = {
+  def createEdges(services: List[ServiceDeployment], g: Graph[Task, DiEdge]): Graph[Task, DiEdge] = {
     def nodeSelection(lookupNodeName: String)(node: g.NodeT): Boolean = node == lookupNodeName
 
     for {
@@ -182,6 +184,8 @@ object TaskManagerActor {
     } yield {
       g += parent ~> children
     }
+
+    g
   }
 
   /**
@@ -194,17 +198,21 @@ object TaskManagerActor {
   def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
     g.topologicalSort match {
       case Right(topology) =>
-        val routers = topology.toList.reverse.foldLeft(Map.empty[String, ActorRef[TaskRequestProtocol.Request]]) {
-          case (acc, node) =>
-            val task: Task = node.value
-            val replicas = if (task.replicas <= 0) 1 else task.replicas
-            context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
-            val pool = Routers.pool(poolSize = replicas)(
-              Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
-            val router: ActorRef[TaskRequestProtocol.Request] = context.spawn(pool, task.name)
-            // TODO: Improvement: we could check if the task has started (before spawning the next task)
-            acc + (task.name -> router)
-        }
+        val routers: Map[String, ActorRef[TaskRequestProtocol.Request]] =
+          topology
+            .toList
+            .reverse
+            .foldLeft(Map.empty[String, ActorRef[TaskRequestProtocol.Request]]) {
+              case (acc, node) =>
+                val task: Task = node.value
+                val replicas = if (task.replicas <= 0) 1 else task.replicas
+                context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
+                val pool = Routers.pool(poolSize = replicas)(
+                  Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
+                val router: ActorRef[TaskRequestProtocol.Request] = context.spawn(pool, task.name)
+                // TODO: Improvement: we could check if the task has started (before spawning the next task)
+                acc + (task.name -> router)
+            }
         Success((g, routers))
       case Left(t) =>
         Failure(new InvalidServiceSpecificationException(s"Cannot spawn Tasks from an invalid topology $t"))
@@ -214,20 +222,19 @@ object TaskManagerActor {
   /**
    * Provides the topology of the Graph, this allows us to spawn the Tasks in the proper order based on their dependencies
    * @param g A Graph containing Nodes/Edges for the services to deploy
-   * @param context An actor context
    * @return A list of Nodes (Tasks)
    */
-  def getTopology(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[List[g.NodeT]] = {
+  def getTopology(g: Graph[Task, DiEdge]): Try[List[g.NodeT]] = {
     g.topologicalSort match {
       case Right(topology) =>
         topology.toList match {
           case topo@h :: t =>
             Success(topo)
           case _ =>
-            Failure(new InvalidServiceSpecificationException("The graph topology is empty"))
+            Failure(EmptyServiceSpecificationException("The graph topology is empty"))
         }
       case Left(_) =>
-        Failure(new InvalidServiceSpecificationException("Could not generate the graph topology due to an invalid service specification"))
+        Failure(InvalidServiceSpecificationException("Could not generate the graph topology due to an invalid service specification"))
     }
   }
 }
