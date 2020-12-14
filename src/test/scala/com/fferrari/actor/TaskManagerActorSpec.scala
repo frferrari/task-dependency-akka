@@ -10,7 +10,7 @@ import org.scalatest.matchers.should.Matchers
 import scalax.collection.GraphPredef._
 import scalax.collection.mutable.Graph
 
-class TaskManagerActorTest
+class TaskManagerActorSpec
   extends AnyFlatSpec
     with Matchers
     with BeforeAndAfterAll
@@ -91,7 +91,7 @@ trait TaskManagerActorTestFixture {
   val serviceC = ServiceDeployment("C", false, 2, List())
   val cyclicServiceC = ServiceDeployment("C", false, 2, List("A"))
 
-  val taskA = TaskManagerActor.Task("A", true, 1)
-  val taskB = TaskManagerActor.Task("B", false, 2)
-  val taskC = TaskManagerActor.Task("C", false, 4)
+  val taskA = TaskManagerActor.Task(0, "A", true, 1)
+  val taskB = TaskManagerActor.Task(1, "B", false, 2)
+  val taskC = TaskManagerActor.Task(2, "C", false, 4)
 }

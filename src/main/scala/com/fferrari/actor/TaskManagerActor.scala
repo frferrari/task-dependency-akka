@@ -24,7 +24,7 @@ object TaskManagerActor {
    * A Task represents a Service and it is handled through Akka actors
    * We need specific equals/hashCode methods for the Graph to be properly handled
    */
-  case class Task(name: String, isEntryPoint: Boolean, replicas: Int) {
+  case class Task(id: Int, name: String, isEntryPoint: Boolean, replicas: Int) {
     override def equals(other: Any): Boolean = other match {
       case that: Task => that.name == this.name
       case that: String => that == this.name
@@ -149,8 +149,8 @@ object TaskManagerActor {
     val g = Graph.empty[Task, DiEdge]
 
     for {
-      service <- services
-    } yield g += Task(name = service.serviceName, isEntryPoint = service.entryPoint, replicas = service.replicas)
+      (service, idx) <- services.zipWithIndex
+    } yield g += Task(id = idx, name = service.serviceName, isEntryPoint = service.entryPoint, replicas = service.replicas)
 
     g
   }
