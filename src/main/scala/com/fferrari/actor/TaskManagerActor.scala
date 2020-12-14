@@ -3,7 +3,7 @@ package com.fferrari.actor
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors, Routers}
 import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy}
 import com.fferrari.actor.protocol.TaskManagerResponseProtocol.WrappedTaskResponse
-import com.fferrari.actor.protocol.{TaskManagerRequestProtocol, TaskManagerResponseProtocol}
+import com.fferrari.actor.protocol.{TaskManagerRequestProtocol, TaskManagerResponseProtocol, TaskRequestProtocol, TaskResponseProtocol}
 import com.fferrari.model.ServiceDeployment
 import scalax.collection.GraphEdge.DiEdge
 import scalax.collection.GraphPredef._
@@ -32,9 +32,9 @@ object TaskManagerActor {
     manageRequests(context.messageAdapter(WrappedTaskResponse))
   }
 
-  def manageRequests(taskResponseMapper: ActorRef[TaskProtocol.Response],
+  def manageRequests(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                      g: Graph[Task, DiEdge] = Graph.empty[Task, DiEdge],
-                     routers: Map[String, ActorRef[TaskProtocol.Request]] = Map.empty[String, ActorRef[TaskProtocol.Request]]): Behavior[TaskManagerRequestProtocol.Request] =
+                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map.empty[String, ActorRef[TaskRequestProtocol.Request]]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
         case TaskManagerRequestProtocol.Deploy(services) =>
@@ -55,7 +55,7 @@ object TaskManagerActor {
                 task <- topology.map(_.value)
                 router <- routers.get(task.name)
               } yield {
-                router ! TaskProtocol.CheckHealth(taskResponseMapper)
+                router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
               }
               tasksHealthChecking(taskResponseMapper, g, routers, topology.size)
 
@@ -66,9 +66,9 @@ object TaskManagerActor {
       }
     }
 
-  def tasksHealthChecking(taskResponseMapper: ActorRef[TaskProtocol.Response],
+  def tasksHealthChecking(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                           g: Graph[Task, DiEdge],
-                          routers: Map[String, ActorRef[TaskProtocol.Request]],
+                          routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
                           taskCount: Int): Behavior[TaskManagerRequestProtocol.Request] = {
     Behaviors.withTimers { timer =>
       // We allow some time for each Task to reply to the HealthCheck message
@@ -78,7 +78,7 @@ object TaskManagerActor {
         message match {
           case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
             wrapped.response match {
-              case TaskProtocol.TaskIsHealthy =>
+              case TaskResponseProtocol.TaskIsHealthy =>
                 context.log.info(s"Received TaskIsHealthy, left with $taskCount Task(s) to check")
 
                 val newTaskCount = taskCount - 1
@@ -101,7 +101,7 @@ object TaskManagerActor {
     }
   }
 
-  def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
+  def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
     val g = Graph.empty[Task, DiEdge]
 
     // Create the Nodes and the Edges
@@ -133,17 +133,17 @@ object TaskManagerActor {
     }
   }
 
-  def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
+  def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
     g.topologicalSort match {
       case Right(topology) =>
-        val routers = topology.toList.reverse.foldLeft(Map.empty[String, ActorRef[TaskProtocol.Request]]) {
+        val routers = topology.toList.reverse.foldLeft(Map.empty[String, ActorRef[TaskRequestProtocol.Request]]) {
           case (acc, node) =>
             val task: Task = node.value
             val replicas = if (task.replicas <= 0) 1 else task.replicas
             context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
             val pool = Routers.pool(poolSize = replicas)(
               Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
-            val router: ActorRef[TaskProtocol.Request] = context.spawn(pool, task.name)
+            val router: ActorRef[TaskRequestProtocol.Request] = context.spawn(pool, task.name)
             // TODO: Improvement: we could check if the task has started (before spawning the next task)
             acc + (task.name -> router)
         }

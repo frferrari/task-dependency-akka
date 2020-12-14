@@ -2,14 +2,16 @@ package com.fferrari.actor
 
 import akka.actor.typed.Behavior
 import akka.actor.typed.scaladsl.Behaviors
+import com.fferrari.actor.protocol.{TaskRequestProtocol, TaskResponseProtocol}
 
 object TaskActor {
-  def apply(): Behavior[TaskProtocol.Request] = Behaviors.setup[TaskProtocol.Request] { context =>
+  def apply(): Behavior[TaskRequestProtocol.Request] = Behaviors.setup[TaskRequestProtocol.Request] { context =>
     context.log.info(s"Starting Task ${context.self.path}")
-    Behaviors.receiveMessage[TaskProtocol.Request] {
-      case TaskProtocol.CheckHealth(replyTo) =>
+
+    Behaviors.receiveMessage[TaskRequestProtocol.Request] {
+      case TaskRequestProtocol.CheckHealth(replyTo) =>
         context.log.info(s"Handling CheckHealth request for Task ${context.self.path}")
-        replyTo ! TaskProtocol.TaskIsHealthy
+        replyTo ! TaskResponseProtocol.TaskIsHealthy
         Behaviors.same
     }
   }
