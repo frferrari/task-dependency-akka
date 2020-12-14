@@ -14,15 +14,16 @@ import scala.util.{Failure, Success, Try}
 
 object TaskManagerActor {
 
-  case class TaskNotDeployedException(message: String) extends Exception(message)
+  val checkHealthTimeout = 3.seconds
 
   case class InvalidServiceSpecificationException(message: String) extends Exception(message)
 
   case class EmptyServiceSpecificationException(message: String) extends Exception(message)
 
   /*
-   * A Task represents a Service and it is handled through Akka actors
-   * We need specific equals/hashCode methods for the Graph to be properly handled
+   * A Task represents a Microservice and it is handled through Akka actors
+   * We need specific equals/hashCode methods for the Graph that represents the deployment
+   * service to be properly handled
    */
   case class Task(id: Int, name: String, isEntryPoint: Boolean, replicas: Int) {
     override def equals(other: Any): Boolean = other match {
@@ -53,26 +54,23 @@ object TaskManagerActor {
     Behaviors.receive { (context, message) =>
       message match {
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
-          val g: Graph[Task, DiEdge] = buildServiceDeploymentGraph(services)
+          buildServiceDeploymentGraph(services) match {
+            case newGraph if newGraph.isCyclic =>
+              context.log.error("The service deployment is cyclic, stopping")
+              replyTo ! TaskManagerResponseProtocol.DeploymentError
+              manageRequests(taskResponseMapper, newGraph, routers)
 
-          if (g.isCyclic) {
-            context.log.error("The service deployment is cyclic, stopping")
-            replyTo ! TaskManagerResponseProtocol.DeploymentError
-            manageRequests(taskResponseMapper, g, routers)
-          } else {
-            spawnTasks(g, taskResponseMapper, replyTo)(context)
+            case newGraph =>
+              spawnTasks(newGraph, taskResponseMapper, replyTo)(context)
           }
 
         case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
           getTopology(g) match {
             case Success(topology) =>
-              // Send a CheckHealth message to each Task Router
-              for {
-                task <- topology.map(_.value)
-                router <- routers.get(task.name)
-              } yield {
-                router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
-              }
+              // Send a CheckHealth message to ALL routers
+              broadcastHealthCheck(topology.map(_.value), routers, taskResponseMapper)
+
+              // Check that ALL Tasks reply with a TaskIsHealthy message
               tasksHealthChecking(taskResponseMapper, g, routers, topology.size, replyTo)
 
             case Failure(e) =>
@@ -83,8 +81,27 @@ object TaskManagerActor {
     }
 
   /**
+   * Allows to broadcast the CheckHealth message to the provided list of Tasks
+   * @param tasks The list of Tasks to broadcast the CheckHealth message to
+   * @param routers The list of Routers to broadcast the CheckHealth message to
+   * @param taskResponseMapper An adapter for the Actor message
+   */
+  def broadcastHealthCheck(tasks: List[Task],
+                           routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
+                           taskResponseMapper: ActorRef[TaskResponseProtocol.Response]): Unit = {
+    for {
+      task <- tasks
+      router <- routers.get(task.name)
+    } yield {
+      router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
+    }
+
+    ()
+  }
+
+  /**
    * Handles the reply of each Task of the service deployment to the HealthCheck message sent to them.
-   * It awaits maximum 3 seconds for each reply per Task :
+   * It awaits maximum `checkHealthTimeout` for each reply per Task :
    *   in case of Timeout it sends back an HealthStatus(false) to the replyTo actor
    *   in case all the replies have been received without Timeout, it sends back an HealthStatus(true) to the replyTo actor
    * @param taskResponseMapper An adapter for the Actor message
@@ -101,7 +118,7 @@ object TaskManagerActor {
                           replyTo: ActorRef[TaskManagerResponseProtocol.Response]): Behavior[TaskManagerRequestProtocol.Request] = {
     Behaviors.withTimers { timer =>
       // We allow some time for each Task to reply to the HealthCheck message
-      timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
+      timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
 
       Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
         message match {
@@ -118,7 +135,7 @@ object TaskManagerActor {
                   replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = true)
                   manageRequests(taskResponseMapper, g, routers)
                 } else {
-                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
                   tasksHealthChecking(taskResponseMapper, g, routers, newTaskCount, replyTo)
                 }
             }
@@ -212,7 +229,6 @@ object TaskManagerActor {
                      replyTo: ActorRef[TaskManagerResponseProtocol.Response],
                      routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map()): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.withTimers { timer =>
-      val timeout = 3.seconds
 
       def spawnNextTask(tasks: List[Task],
                         routers: Map[String, ActorRef[TaskRequestProtocol.Request]]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
@@ -223,7 +239,7 @@ object TaskManagerActor {
                 case task :: t =>
                   val router = spawnTask(task)(context)
                   router ! TaskRequestProtocol.CheckHealth(taskResponseMapper.ref)
-                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, timeout)
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
 
                   awaitHealthCheckStatus(tasks, task, router, routers)
 
