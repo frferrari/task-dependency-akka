@@ -49,20 +49,18 @@ object TaskManagerActor {
    */
   def manageRequests(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                      g: Graph[Task, DiEdge] = Graph.empty[Task, DiEdge],
-                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map.empty[String, ActorRef[TaskRequestProtocol.Request]]): Behavior[TaskManagerRequestProtocol.Request] =
+                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map()): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
-          deploy(services)(context) match {
-            case Success((newGraph, routers)) =>
-              context.log.info("All Tasks successfully deployed")
-              replyTo ! TaskManagerResponseProtocol.DeploymentSuccessful
-              manageRequests(taskResponseMapper, newGraph, routers)
+          val g: Graph[Task, DiEdge] = buildServiceDeploymentGraph(services)
 
-            case Failure(e) =>
-              context.log.error("Error encountered while deploying the Tasks: " + e.getMessage)
-              replyTo ! TaskManagerResponseProtocol.DeploymentError
-              manageRequests(taskResponseMapper, g, routers)
+          if (g.isCyclic) {
+            context.log.error("The service deployment is cyclic, stopping")
+            replyTo ! TaskManagerResponseProtocol.DeploymentError
+            manageRequests(taskResponseMapper, g, routers)
+          } else {
+            spawnTasks(g, taskResponseMapper, replyTo)(context)
           }
 
         case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
@@ -135,23 +133,12 @@ object TaskManagerActor {
   }
 
   /**
-   * Creates a graph for the service deployment and spawns all the Tasks for this graph, including their dependencies,
-   * only if the graph is not cyclic.
+   * Creates a graph for the provided service deployment
    * @param services A list of services to deploy
-   * @param context An actor context
-   * @return The Graph of tasks and a Map of the Actors for this tasks
+   * @return The Graph of tasks for the provided service deployment
    */
-  def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
-    // Create the Nodes and the Edges
-    val g = createNodes(services)
-    createEdges(services, g)
-
-    // Spawn the Tasks if the deployment specification is not cyclic
-    if (g.isCyclic)
-      Failure(new IllegalArgumentException("The service deployment specification is cyclic"))
-    else
-      spawnTasks(g)
-  }
+  def buildServiceDeploymentGraph(services: List[ServiceDeployment]): Graph[Task, DiEdge] =
+    createEdges(services, createNodes(services))
 
   /**
    * Creates the Nodes of a Graph corresponding to a given list of services
@@ -195,28 +182,118 @@ object TaskManagerActor {
    * @param context An actor context
    * @return When successful it returns the provided Graph and a Map of Tasks and their ActorRef
    */
-  def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
+  def spawnTasks(g: Graph[Task, DiEdge],
+                 taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
+                 replyTo: ActorRef[TaskManagerResponseProtocol.Response])
+                (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] = {
     g.topologicalSort match {
       case Right(topology) =>
-        val routers: Map[String, ActorRef[TaskRequestProtocol.Request]] =
-          topology
-            .toList
-            .reverse
-            .foldLeft(Map.empty[String, ActorRef[TaskRequestProtocol.Request]]) {
-              case (acc, node) =>
-                val task: Task = node.value
-                val replicas = if (task.replicas <= 0) 1 else task.replicas
-                context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
-                val pool = Routers.pool(poolSize = replicas)(
-                  Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
-                val router: ActorRef[TaskRequestProtocol.Request] = context.spawn(pool, task.name)
-                // TODO: Improvement: we could check if the task has started (before spawning the next task)
-                acc + (task.name -> router)
-            }
-        Success((g, routers))
-      case Left(t) =>
-        Failure(new InvalidServiceSpecificationException(s"Cannot spawn Tasks from an invalid topology $t"))
+        context.self ! TaskManagerRequestProtocol.SpawnNextTask
+        spawnWithCheck(topology.toList.reverse.map(_.value), g, taskResponseMapper, replyTo)
+
+      case Left(_) =>
+        replyTo ! TaskManagerResponseProtocol.DeploymentError
+        manageRequests(taskResponseMapper, g)
     }
+  }
+
+  /**
+   * Spawns all the tasks from the provided list of Task, checking that each new Task is healthy before spawning the next Task
+   * @param tasks The list of Tasks to spawn
+   * @param g A Graph containing Nodes/Edges for the services to deploy
+   * @param taskResponseMapper An adapter for the Actor message
+   * @param replyTo The ActorRef for the reply status
+   * @param routers A Map containing the ActorRef of each Task router
+   * @return The next Behavior to switch to
+   */
+  def spawnWithCheck(tasks: List[Task],
+                     g: Graph[Task, DiEdge],
+                     taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
+                     replyTo: ActorRef[TaskManagerResponseProtocol.Response],
+                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map()): Behavior[TaskManagerRequestProtocol.Request] =
+    Behaviors.withTimers { timer =>
+      val timeout = 3.seconds
+
+      def spawnNextTask(tasks: List[Task],
+                        routers: Map[String, ActorRef[TaskRequestProtocol.Request]]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+        Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
+          message match {
+            case TaskManagerRequestProtocol.SpawnNextTask =>
+              tasks match {
+                case task :: t =>
+                  val router = spawnTask(task)(context)
+                  router ! TaskRequestProtocol.CheckHealth(taskResponseMapper.ref)
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, timeout)
+
+                  awaitHealthCheckStatus(tasks, task, router, routers)
+
+                case _ =>
+                  context.log.info("All Tasks were successfully deployed")
+                  timer.cancelAll()
+                  replyTo ! TaskManagerResponseProtocol.DeploymentSuccessful
+                  manageRequests(taskResponseMapper, g, routers)
+              }
+          }
+        }
+
+      def awaitHealthCheckStatus(tasks: List[Task],
+                                 task: Task,
+                                 router: ActorRef[TaskRequestProtocol.Request],
+                                 routers: Map[String, ActorRef[TaskRequestProtocol.Request]]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+        Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
+          message match {
+            case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
+              wrapped.response match {
+                case TaskResponseProtocol.TaskIsHealthy =>
+                  context.log.info("Received TaskIsHealthy message, spawning next Task")
+                  context.self ! TaskManagerRequestProtocol.SpawnNextTask
+                  spawnNextTask(tasks.tail, routers + (task.name -> router))
+
+                case msg =>
+                  context.log.error(s"Unexpected message received while waiting for a Task health check status ($msg)")
+                  cleanUp(routers, context)
+                  replyTo ! TaskManagerResponseProtocol.DeploymentError
+                  manageRequests(taskResponseMapper, Graph(), Map())
+             }
+
+            case TaskManagerRequestProtocol.HealthCheckTimeout =>
+              context.log.error("A HealthCheck Timeout has been received while waiting for a spawned Task")
+              cleanUp(routers, context)
+              replyTo ! TaskManagerResponseProtocol.DeploymentError
+              manageRequests(taskResponseMapper, Graph(), Map())
+          }
+        }
+
+      spawnNextTask(tasks, routers)
+    }
+
+  /**
+   * Spawns one Task (and its replicas)
+   * @param task The Task to be spawned
+   * @param context An actor context
+   * @return The ActorRef of the spawned Task
+   */
+  def spawnTask(task: Task)(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): ActorRef[TaskRequestProtocol.Request] = {
+    val replicas = if (task.replicas <= 0) 1 else task.replicas
+    context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
+    val pool = Routers.pool(poolSize = replicas)(Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
+
+    context.spawn(pool, task.name)
+  }
+
+  /**
+   * Stops all the actors from a provided list of actors
+   * @param routers A Map containing the ActorRef of each Task router
+   * @param context An actor context
+   */
+  def cleanUp(routers: Map[String, ActorRef[TaskRequestProtocol.Request]], context: ActorContext[TaskManagerRequestProtocol.Request]): Unit = {
+    context.log.info("Stopping all Tasks ...")
+    routers
+      .foreach {
+        case (taskName, task) =>
+          context.log.info(s"Stopping Task $task")
+          context.stop(task)
+      }
   }
 
   /**

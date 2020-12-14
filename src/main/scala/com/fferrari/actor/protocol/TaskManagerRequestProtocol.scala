@@ -13,4 +13,6 @@ object TaskManagerRequestProtocol {
 
   final case object HealthCheckTimeout extends Request
 
+  final case object SpawnNextTask extends Request
+
 }
