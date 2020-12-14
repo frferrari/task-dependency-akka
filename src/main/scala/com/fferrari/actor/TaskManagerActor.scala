@@ -18,6 +18,10 @@ object TaskManagerActor {
 
   class InvalidServiceSpecificationException(message: String) extends Exception(message)
 
+  /*
+   * A Task represents a Service and it is handled through Akka actors
+   * We need specific equals/hashCode methods for the Graph to be properly handled
+   */
   case class Task(name: String, isEntryPoint: Boolean, replicas: Int) {
     override def equals(other: Any): Boolean = other match {
       case that: Task => that.name == this.name
@@ -32,18 +36,30 @@ object TaskManagerActor {
     manageRequests(context.messageAdapter(WrappedTaskResponse))
   }
 
+  /**
+   * The main Behavior that handles the following messages:
+   *   TaskManagerRequestProtocol.Deploy
+   *   TaskManagerRequestProtocol.CheckHealth
+   * @param taskResponseMapper An adapter for the Actor message
+   * @param g The Graph containing the Nodes for the services to deploy
+   * @param routers A Map containing the ActorRef of each Task router
+   * @return The next Behavior to switch to
+   */
   def manageRequests(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                      g: Graph[Task, DiEdge] = Graph.empty[Task, DiEdge],
                      routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map.empty[String, ActorRef[TaskRequestProtocol.Request]]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
-        case TaskManagerRequestProtocol.Deploy(services) =>
+        case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
           deploy(services)(context) match {
             case Success((newGraph, routers)) =>
               context.log.info("All Tasks successfully deployed")
+              replyTo ! TaskManagerResponseProtocol.DeploymentSuccessful
               manageRequests(taskResponseMapper, newGraph, routers)
+
             case Failure(e) =>
               context.log.error("Error encountered while deploying the Tasks: " + e.getMessage)
+              replyTo ! TaskManagerResponseProtocol.DeploymentError
               manageRequests(taskResponseMapper, g, routers)
           }
 
@@ -66,6 +82,18 @@ object TaskManagerActor {
       }
     }
 
+  /**
+   * Handles the reply of each Task of the service deployment to the HealthCheck message sent to them.
+   * It awaits maximum 3 seconds for each reply per Task :
+   *   in case of Timeout it sends back an HealthStatus(false) to the replyTo actor
+   *   in case all the replies have been received without Timeout, it sends back an HealthStatus(true) to the replyTo actor
+   * @param taskResponseMapper An adapter for the Actor message
+   * @param g The Graph containing the Nodes for the services to deploy
+   * @param routers A Map containing the ActorRef of each Task router
+   * @param taskCount A counf of Task for which to await a reply
+   * @param replyTo The ActorRef for the reply status
+   * @return The next Behavior to switch to
+   */
   def tasksHealthChecking(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                           g: Graph[Task, DiEdge],
                           routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
@@ -104,11 +132,16 @@ object TaskManagerActor {
     }
   }
 
+  /**
+   * Creates a graph for the service deployment and spawns all the Tasks for this graph, including their dependencies,
+   * only if the graph is not cyclic.
+   * @param services A list of services to deploy
+   * @param context An actor context
+   * @return The Graph of tasks and a Map of the Actors for this tasks
+   */
   def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
-    val g = Graph.empty[Task, DiEdge]
-
     // Create the Nodes and the Edges
-    createNodes(services, g)
+    val g = createNodes(services)
     createEdges(services, g)
 
     // Spawn the Tasks if the deployment specification is not cyclic
@@ -118,11 +151,26 @@ object TaskManagerActor {
       spawnTasks(g)
   }
 
-  def createNodes(services: List[ServiceDeployment], g: Graph[Task, DiEdge]): Unit =
+  /**
+   * Creates the Nodes of a Graph corresponding to a given list of services
+   * @param services A list of services to deploy
+   * @return The Graph of Noddes
+   */
+  def createNodes(services: List[ServiceDeployment]): Graph[Task, DiEdge] = {
+    val g = Graph.empty[Task, DiEdge]
+
     for {
       service <- services
     } yield g += Task(name = service.serviceName, isEntryPoint = service.entryPoint, replicas = service.replicas)
 
+    g
+  }
+
+  /**
+   * Creates the Edges of a Graph corresponding to a given list of services
+   * @param services A list of services to deploy
+   * @param g The Graph containing the Nodes for the services to deploy
+   */
   def createEdges(services: List[ServiceDeployment], g: Graph[Task, DiEdge]): Unit = {
     def nodeSelection(lookupNodeName: String)(node: g.NodeT): Boolean = node == lookupNodeName
 
@@ -136,6 +184,13 @@ object TaskManagerActor {
     }
   }
 
+  /**
+   * Given a Graph instantiated from a list of services, it spawns the Tasks (as Akka actors) in the proper order
+   * based on the Tasks dependencies. Note that it uses Akka routing mechanism to spawn replicas too
+   * @param g A Graph containing Nodes/Edges for the services to deploy
+   * @param context An actor context
+   * @return When successful it returns the provided Graph and a Map of Tasks and their ActorRef
+   */
   def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskRequestProtocol.Request]])] = {
     g.topologicalSort match {
       case Right(topology) =>
@@ -156,6 +211,12 @@ object TaskManagerActor {
     }
   }
 
+  /**
+   * Provides the topology of the Graph, this allows us to spawn the Tasks in the proper order based on their dependencies
+   * @param g A Graph containing Nodes/Edges for the services to deploy
+   * @param context An actor context
+   * @return A list of Nodes (Tasks)
+   */
   def getTopology(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[List[g.NodeT]] = {
     g.topologicalSort match {
       case Right(topology) =>

@@ -14,7 +14,7 @@ import com.fferrari.model.{ServiceDeployment, ServiceDeploymentJsonProtocol}
 
 import scala.concurrent.duration.DurationInt
 import scala.io.StdIn
-import scala.util.Success
+import scala.util.{Failure, Success}
 
 object NexthinkChallengeApp
   extends App
@@ -27,8 +27,25 @@ object NexthinkChallengeApp
     path("deploy") {
       post {
         entity(as[List[ServiceDeployment]]) { serviceDeployment =>
-          actorSystem ! TaskManagerRequestProtocol.Deploy(serviceDeployment)
-          complete(StatusCodes.OK)
+          onComplete {
+            implicit val timeout: Timeout = 3.seconds
+            actorSystem.ask(ref => TaskManagerRequestProtocol.Deploy(serviceDeployment, ref))
+          } {
+            case Success(TaskManagerResponseProtocol.DeploymentSuccessful) =>
+              complete(StatusCodes.OK)
+
+            case Success(_) =>
+              complete(
+                StatusCodes.InternalServerError,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "UNKNOWN", "reason": "Unknown deployment status" }"""
+                )
+              )
+
+            case Failure(_) =>
+              complete(StatusCodes.InternalServerError)
+          }
         }
       }
     } ~
