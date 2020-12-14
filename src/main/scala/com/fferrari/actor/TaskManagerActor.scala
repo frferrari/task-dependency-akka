@@ -47,7 +47,7 @@ object TaskManagerActor {
               manageRequests(taskResponseMapper, g, routers)
           }
 
-        case TaskManagerRequestProtocol.CheckHealth =>
+        case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
           getTopology(g)(context) match {
             case Success(topology) =>
               // Send a CheckHealth message to each Task Router
@@ -57,7 +57,7 @@ object TaskManagerActor {
               } yield {
                 router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
               }
-              tasksHealthChecking(taskResponseMapper, g, routers, topology.size)
+              tasksHealthChecking(taskResponseMapper, g, routers, topology.size, replyTo)
 
             case Failure(e) =>
               context.log.error(e.getMessage)
@@ -69,7 +69,8 @@ object TaskManagerActor {
   def tasksHealthChecking(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                           g: Graph[Task, DiEdge],
                           routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
-                          taskCount: Int): Behavior[TaskManagerRequestProtocol.Request] = {
+                          taskCount: Int,
+                          replyTo: ActorRef[TaskManagerResponseProtocol.Response]): Behavior[TaskManagerRequestProtocol.Request] = {
     Behaviors.withTimers { timer =>
       // We allow some time for each Task to reply to the HealthCheck message
       timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
@@ -86,15 +87,17 @@ object TaskManagerActor {
                 if (newTaskCount <= 0) {
                   timer.cancelAll()
                   context.log.info("All Tasks are healthy")
+                  replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = true)
                   manageRequests(taskResponseMapper, g, routers)
                 } else {
                   timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
-                  tasksHealthChecking(taskResponseMapper, g, routers, newTaskCount)
+                  tasksHealthChecking(taskResponseMapper, g, routers, newTaskCount, replyTo)
                 }
             }
 
           case TaskManagerRequestProtocol.HealthCheckTimeout =>
             context.log.error("A HealthCheck Timeout has been received, as least one service is not healthy")
+            replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = false)
             manageRequests(taskResponseMapper, g, routers)
         }
       }

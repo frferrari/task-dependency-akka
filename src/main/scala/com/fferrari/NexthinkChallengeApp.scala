@@ -1,16 +1,20 @@
 package com.fferrari
 
+import akka.actor.typed.scaladsl.AskPattern.{Askable, schedulerFromActorSystem}
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.{ActorSystem, Behavior}
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.server.Directives._
+import akka.util.Timeout
 import com.fferrari.actor.TaskManagerActor
-import com.fferrari.actor.protocol.TaskManagerRequestProtocol
+import com.fferrari.actor.protocol.{TaskManagerRequestProtocol, TaskManagerResponseProtocol}
 import com.fferrari.model.{ServiceDeployment, ServiceDeploymentJsonProtocol}
 
+import scala.concurrent.duration.DurationInt
 import scala.io.StdIn
+import scala.util.Success
 
 object NexthinkChallengeApp
   extends App
@@ -30,8 +34,37 @@ object NexthinkChallengeApp
     } ~
       path("check") {
         get {
-          actorSystem ! TaskManagerRequestProtocol.CheckHealth
-          complete(StatusCodes.OK)
+          onComplete {
+            implicit val timeout: Timeout = 3.seconds
+            actorSystem.ask(ref => TaskManagerRequestProtocol.CheckHealth(ref))
+          } {
+            case Success(TaskManagerResponseProtocol.HealthStatus(true)) =>
+              complete(
+                StatusCodes.OK,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "HEALTHY" }"""
+                )
+              )
+
+            case Success(TaskManagerResponseProtocol.HealthStatus(false)) =>
+              complete(
+                StatusCodes.InternalServerError,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "UNHEALTHY" }"""
+                )
+              )
+
+            case _ =>
+              complete(
+                StatusCodes.InternalServerError,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "UNKNOWN" }"""
+                )
+              )
+          }
         }
       }
 
