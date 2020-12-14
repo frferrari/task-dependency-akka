@@ -2,12 +2,14 @@ package com.fferrari.actor
 
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors, Routers}
 import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy}
-import com.fferrari.actor.TaskManagerProtocol.WrappedTaskResponse
+import com.fferrari.actor.protocol.TaskManagerResponseProtocol.WrappedTaskResponse
+import com.fferrari.actor.protocol.{TaskManagerRequestProtocol, TaskManagerResponseProtocol}
 import com.fferrari.model.ServiceDeployment
 import scalax.collection.GraphEdge.DiEdge
 import scalax.collection.GraphPredef._
 import scalax.collection.mutable.Graph
 
+import scala.concurrent.duration.DurationInt
 import scala.util.{Failure, Success, Try}
 
 object TaskManagerActor {
@@ -26,16 +28,16 @@ object TaskManagerActor {
     override def hashCode(): Int = name.##
   }
 
-  def apply(): Behavior[TaskManagerProtocol.Request] = Behaviors.setup[TaskManagerProtocol.Request] { context =>
+  def apply(): Behavior[TaskManagerRequestProtocol.Request] = Behaviors.setup[TaskManagerRequestProtocol.Request] { context =>
     manageRequests(context.messageAdapter(WrappedTaskResponse))
   }
 
   def manageRequests(taskResponseMapper: ActorRef[TaskProtocol.Response],
                      g: Graph[Task, DiEdge] = Graph.empty[Task, DiEdge],
-                     routers: Map[String, ActorRef[TaskProtocol.Request]] = Map.empty[String, ActorRef[TaskProtocol.Request]]): Behavior[TaskManagerProtocol.Request] =
+                     routers: Map[String, ActorRef[TaskProtocol.Request]] = Map.empty[String, ActorRef[TaskProtocol.Request]]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
-        case TaskManagerProtocol.Deploy(services) =>
+        case TaskManagerRequestProtocol.Deploy(services) =>
           deploy(services)(context) match {
             case Success((newGraph, routers)) =>
               context.log.info("All Tasks successfully deployed")
@@ -45,7 +47,7 @@ object TaskManagerActor {
               manageRequests(taskResponseMapper, g, routers)
           }
 
-        case TaskManagerProtocol.CheckHealth =>
+        case TaskManagerRequestProtocol.CheckHealth =>
           getTopology(g)(context) match {
             case Success(topology) =>
               // Send a CheckHealth message to each Task Router
@@ -67,38 +69,48 @@ object TaskManagerActor {
   def tasksHealthChecking(taskResponseMapper: ActorRef[TaskProtocol.Response],
                           g: Graph[Task, DiEdge],
                           routers: Map[String, ActorRef[TaskProtocol.Request]],
-                          taskCount: Int): Behavior[TaskManagerProtocol.Request] = {
+                          taskCount: Int): Behavior[TaskManagerRequestProtocol.Request] = {
     Behaviors.withTimers { timer =>
-      Behaviors.receive[TaskManagerProtocol.Request] { (context, message) =>
+      // We allow some time for each Task to reply to the HealthCheck message
+      timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
+
+      Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
         message match {
-          case wrapped: TaskManagerProtocol.WrappedTaskResponse =>
+          case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
             wrapped.response match {
               case TaskProtocol.TaskIsHealthy =>
-                context.log.info(s"Received TaskIsHealthy, left with $taskCount tasks")
+                context.log.info(s"Received TaskIsHealthy, left with $taskCount Task(s) to check")
 
                 val newTaskCount = taskCount - 1
 
                 if (newTaskCount <= 0) {
-                  context.log.info("All tasks are healthy")
+                  timer.cancelAll()
+                  context.log.info("All Tasks are healthy")
                   manageRequests(taskResponseMapper, g, routers)
-                } else
+                } else {
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, 3.seconds)
                   tasksHealthChecking(taskResponseMapper, g, routers, newTaskCount)
+                }
             }
+
+          case TaskManagerRequestProtocol.HealthCheckTimeout =>
+            context.log.error("A HealthCheck Timeout has been received, as least one service is not healthy")
+            manageRequests(taskResponseMapper, g, routers)
         }
       }
     }
   }
 
-  def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
+  def deploy(services: List[ServiceDeployment])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
     val g = Graph.empty[Task, DiEdge]
 
     // Create the Nodes and the Edges
     createNodes(services, g)
     createEdges(services, g)
 
-    // Spawn the Tasks if the deployment specification is acyclic
+    // Spawn the Tasks if the deployment specification is not cyclic
     if (g.isCyclic)
-      Failure(new IllegalArgumentException("The service deployment specification is not acyclic"))
+      Failure(new IllegalArgumentException("The service deployment specification is cyclic"))
     else
       spawnTasks(g)
   }
@@ -121,7 +133,7 @@ object TaskManagerActor {
     }
   }
 
-  def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
+  def spawnTasks(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[(Graph[Task, DiEdge], Map[String, ActorRef[TaskProtocol.Request]])] = {
     g.topologicalSort match {
       case Right(topology) =>
         val routers = topology.toList.reverse.foldLeft(Map.empty[String, ActorRef[TaskProtocol.Request]]) {
@@ -141,7 +153,7 @@ object TaskManagerActor {
     }
   }
 
-  def getTopology(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerProtocol.Request]): Try[List[g.NodeT]] = {
+  def getTopology(g: Graph[Task, DiEdge])(implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Try[List[g.NodeT]] = {
     g.topologicalSort match {
       case Right(topology) =>
         topology.toList match {

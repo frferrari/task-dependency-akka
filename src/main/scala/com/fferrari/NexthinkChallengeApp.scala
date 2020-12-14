@@ -6,7 +6,8 @@ import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.server.Directives._
-import com.fferrari.actor.{TaskManagerActor, TaskManagerProtocol}
+import com.fferrari.actor.TaskManagerActor
+import com.fferrari.actor.protocol.TaskManagerRequestProtocol
 import com.fferrari.model.{ServiceDeployment, ServiceDeploymentJsonProtocol}
 
 import scala.io.StdIn
@@ -22,14 +23,14 @@ object NexthinkChallengeApp
     path("deploy") {
       post {
         entity(as[List[ServiceDeployment]]) { serviceDeployment =>
-          actorSystem ! TaskManagerProtocol.Deploy(serviceDeployment)
+          actorSystem ! TaskManagerRequestProtocol.Deploy(serviceDeployment)
           complete(StatusCodes.OK)
         }
       }
     } ~
       path("check") {
         get {
-          actorSystem ! TaskManagerProtocol.CheckHealth
+          actorSystem ! TaskManagerRequestProtocol.CheckHealth
           complete(StatusCodes.OK)
         }
       }
