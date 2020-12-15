@@ -81,6 +81,15 @@ object NexthinkChallengeApp
                 )
               )
 
+            case Success(TaskManagerResponseProtocol.WrongTopology) =>
+              complete(
+                StatusCodes.BadRequest,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "WRONG_TOPOLOGY", "reason": "The service deployment was invalid, maybe cyclic" }"""
+                )
+              )
+
             case _ =>
               complete(
                 StatusCodes.InternalServerError,

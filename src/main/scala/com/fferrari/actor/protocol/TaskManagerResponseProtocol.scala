@@ -11,6 +11,8 @@ object TaskManagerResponseProtocol {
 
   final case object ServiceIsNotDeployed extends Response
 
+  final case object WrongTopology extends Response
+
   final case class WrappedTaskResponse(response: TaskResponseProtocol.Response) extends TaskManagerRequestProtocol.Request
 
 }

@@ -72,6 +72,11 @@ object TaskManagerActor {
               spawnTasks(newGraph, taskResponseMapper, replyTo)(context)
           }
 
+        case TaskManagerRequestProtocol.CheckHealth(replyTo) if g.isEmpty =>
+          context.log.info("Trying to check a service that is not deployed")
+          replyTo ! TaskManagerResponseProtocol.ServiceIsNotDeployed
+          Behaviors.same
+
         case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
           getTopology(g) match {
             case Success(_) =>
@@ -79,7 +84,7 @@ object TaskManagerActor {
 
             case Failure(e) =>
               context.log.error(e.getMessage)
-              replyTo ! TaskManagerResponseProtocol.ServiceIsNotDeployed
+              replyTo ! TaskManagerResponseProtocol.WrongTopology
               Behaviors.same
           }
       }
