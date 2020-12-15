@@ -9,6 +9,8 @@ object TaskManagerResponseProtocol {
 
   final case class HealthStatus(isHealthy: Boolean) extends Response
 
+  final case object ServiceIsNotDeployed extends Response
+
   final case class WrappedTaskResponse(response: TaskResponseProtocol.Response) extends TaskManagerRequestProtocol.Request
 
 }

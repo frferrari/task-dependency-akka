@@ -79,6 +79,7 @@ object TaskManagerActor {
 
             case Failure(e) =>
               context.log.error(e.getMessage)
+              replyTo ! TaskManagerResponseProtocol.ServiceIsNotDeployed
               Behaviors.same
           }
       }

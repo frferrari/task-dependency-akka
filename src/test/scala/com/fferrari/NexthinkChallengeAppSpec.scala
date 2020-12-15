@@ -25,6 +25,12 @@ class NexthinkChallengeAppSpec
   implicit val scheduler = system.scheduler
 
   "The deployment service" should {
+    "return a BADREQUEST response for GET requests to /check when the service is not deployed" in {
+      Get("/check") ~> NexthinkChallengeApp.routes ~> check {
+        status shouldBe StatusCodes.BadRequest
+      }
+    }
+
     "return a OK response for POST requests to /deploy with an acyclic deployment graph" in {
       Post("/deploy", List(serviceA, serviceB, serviceC)) ~> NexthinkChallengeApp.routes ~> check {
         status shouldBe StatusCodes.OK

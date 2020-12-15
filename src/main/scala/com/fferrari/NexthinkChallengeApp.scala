@@ -72,6 +72,15 @@ object NexthinkChallengeApp
                 )
               )
 
+            case Success(TaskManagerResponseProtocol.ServiceIsNotDeployed) =>
+              complete(
+                StatusCodes.BadRequest,
+                HttpEntity(
+                  ContentTypes.`application/json`,
+                  """{ "status": "NOT_DEPLOYED", "reason": "No service has been deployed" }"""
+                )
+              )
+
             case _ =>
               complete(
                 StatusCodes.InternalServerError,
