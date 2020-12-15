@@ -3,6 +3,7 @@
 **Please read the PDF found in this repo** for the details of this assessment
 
 To run the code, you could package or simply issue a `run` command from IntelliJ for example
+To run the tests, simply issue the `test` command from IntelliJ for example
 
 ## API
 
