@@ -59,18 +59,13 @@ object TaskManagerActor {
       message match {
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
 
-          // Stop any existing deployment
-          // val newRouters = cleanUp(routers)(context)
-          // Thread.sleep(3000) // TODO: Nobody wants to Thread.sleep, we should check for the Actors to be stopped
-          val newRouters = routers
-
           // Build the Service Deployment Graph
           buildServiceDeploymentGraph(services) match {
             case newGraph if newGraph.isCyclic =>
               // Reject the deployment request if the Graph is cyclic
               context.log.error("The service deployment is cyclic, stopping")
               replyTo ! TaskManagerResponseProtocol.DeploymentError
-              manageRequests(taskResponseMapper, newGraph, newRouters)
+              manageRequests(taskResponseMapper, newGraph, routers)
 
             case newGraph =>
               // If the Graph is acyclic then we can spawn the Tasks
@@ -185,7 +180,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @return The Graph of tasks for the provided service deployment
    */
-  def buildServiceDeploymentGraph(services: List[ServiceDeployment]): Graph[Task, DiEdge] =
+  def buildServiceDeploymentGraph(services: List[ServiceDeployment]): TaskGraph =
     createEdges(services, createNodes(services))
 
   /**
@@ -193,7 +188,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @return The Graph of Noddes
    */
-  def createNodes(services: List[ServiceDeployment]): Graph[Task, DiEdge] = {
+  def createNodes(services: List[ServiceDeployment]): TaskGraph = {
     val g = Graph.empty[Task, DiEdge]
 
     for {
@@ -208,7 +203,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @param g The Graph containing the Nodes for the services to deploy
    */
-  def createEdges(services: List[ServiceDeployment], g: TaskGraph): Graph[Task, DiEdge] = {
+  def createEdges(services: List[ServiceDeployment], g: TaskGraph): TaskGraph = {
     def nodeSelection(lookupNodeName: String)(node: g.NodeT): Boolean = node == lookupNodeName
 
     for {
@@ -335,7 +330,7 @@ object TaskManagerActor {
    * @param context An actor context
    */
   def cleanUp(routers: TaskRouters)
-             (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Map[String, ActorRef[TaskRequestProtocol.Request]] = {
+             (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): TaskRouters = {
     context.log.info("Stopping all Tasks ...")
 
     routers
