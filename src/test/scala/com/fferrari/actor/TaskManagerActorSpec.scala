@@ -91,7 +91,7 @@ trait TaskManagerActorTestFixture {
   val serviceC = ServiceDeployment("C", false, 2, List())
   val cyclicServiceC = ServiceDeployment("C", false, 2, List("A"))
 
-  val taskA = TaskManagerActor.Task(0, "A", true, 1)
-  val taskB = TaskManagerActor.Task(1, "B", false, 2)
-  val taskC = TaskManagerActor.Task(2, "C", false, 4)
+  val taskA = TaskManagerActor.Task(0, "A", true, 1, List("B", "C"))
+  val taskB = TaskManagerActor.Task(1, "B", false, 2, List("C"))
+  val taskC = TaskManagerActor.Task(2, "C", false, 4, List())
 }

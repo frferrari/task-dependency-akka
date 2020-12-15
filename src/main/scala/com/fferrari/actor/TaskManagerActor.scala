@@ -14,6 +14,10 @@ import scala.util.{Failure, Success, Try}
 
 object TaskManagerActor {
 
+  type TaskGraph = Graph[Task, DiEdge]
+  type TaskRouter = ActorRef[TaskRequestProtocol.Request]
+  type TaskRouters = Map[String, TaskRouter]
+
   val checkHealthTimeout = 3.seconds
 
   case class InvalidServiceSpecificationException(message: String) extends Exception(message)
@@ -25,7 +29,7 @@ object TaskManagerActor {
    * We need specific equals/hashCode methods for the Graph that represents the deployment
    * service to be properly handled
    */
-  case class Task(id: Int, name: String, isEntryPoint: Boolean, replicas: Int) {
+  case class Task(id: Int, name: String, isEntryPoint: Boolean, replicas: Int, dependencies: List[String]) {
     override def equals(other: Any): Boolean = other match {
       case that: Task => that.name == this.name
       case that: String => that == this.name
@@ -49,8 +53,8 @@ object TaskManagerActor {
    * @return The next Behavior to switch to
    */
   def manageRequests(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
-                     g: Graph[Task, DiEdge] = Graph.empty[Task, DiEdge],
-                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map()): Behavior[TaskManagerRequestProtocol.Request] =
+                     g: TaskGraph = Graph(),
+                     routers: TaskRouters = Map()): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
@@ -75,12 +79,8 @@ object TaskManagerActor {
 
         case TaskManagerRequestProtocol.CheckHealth(replyTo) =>
           getTopology(g) match {
-            case Success(topology) =>
-              // Send a CheckHealth message to ALL routers
-              broadcastHealthCheck(topology.map(_.value), routers, taskResponseMapper)
-
-              // Check that ALL Routers reply with a TaskIsHealthy message
-              tasksHealthChecking(taskResponseMapper, g, routers, topology.size, replyTo)
+            case Success(_) =>
+              tasksHealthCheck(g, routers, taskResponseMapper, replyTo)(context)
 
             case Failure(e) =>
               context.log.error(e.getMessage)
@@ -90,73 +90,95 @@ object TaskManagerActor {
     }
 
   /**
-   * Allows to broadcast the CheckHealth message to the provided list of Tasks
-   * @param tasks The list of Tasks to broadcast the CheckHealth message to
+   * Allows to check that all the Tasks and their dependencies are healthy,
+   * It starts from the entryPoint task and goes down the Graph of Tasks, and for each dependent Task,
+   *   it sends a CheckHealth message and waits for the reply.
+   * In case a Task does not answer in the appropriate time range, the service is considered unhealthy.
+   * @param g The Graph containing the Nodes for the services to deploy
    * @param routers The list of Routers to broadcast the CheckHealth message to
    * @param taskResponseMapper An adapter for the Actor message
-   */
-  def broadcastHealthCheck(tasks: List[Task],
-                           routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
-                           taskResponseMapper: ActorRef[TaskResponseProtocol.Response]): Unit = {
-    for {
-      task <- tasks
-      router <- routers.get(task.name)
-    } yield {
-      router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
-    }
-
-    ()
-  }
-
-  /**
-   * Handles the reply of each Task of the service deployment to the HealthCheck message sent to them.
-   * It awaits maximum `checkHealthTimeout` for each reply per Task :
-   *   in case of Timeout it sends back an HealthStatus(false) to the replyTo actor
-   *   in case all the replies have been received without Timeout, it sends back an HealthStatus(true) to the replyTo actor
-   * @param taskResponseMapper An adapter for the Actor message
-   * @param g The Graph containing the Nodes for the services to deploy
-   * @param routers A Map containing the ActorRef of each Task router
-   * @param taskCount A counf of Task for which to await a reply
    * @param replyTo The ActorRef for the reply status
+   * @param context An actor context
    * @return The next Behavior to switch to
    */
-  def tasksHealthChecking(taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
-                          g: Graph[Task, DiEdge],
-                          routers: Map[String, ActorRef[TaskRequestProtocol.Request]],
-                          taskCount: Int,
-                          replyTo: ActorRef[TaskManagerResponseProtocol.Response]): Behavior[TaskManagerRequestProtocol.Request] = {
+  def tasksHealthCheck(g: TaskGraph,
+                       routers: TaskRouters,
+                       taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
+                       replyTo: ActorRef[TaskManagerResponseProtocol.Response])
+                      (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.withTimers { timer =>
-      // We allow some time for each Task to reply to the HealthCheck message
-      timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
+      def taskHealthCheck(itTasks: Iterator[Task]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+        Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
+          message match {
+            case TaskManagerRequestProtocol.HealthCheckNextTask =>
+              itTasks.nextOption match {
+                case Some(task) if task.dependencies.nonEmpty =>
+                  val expectedReplies: Int = healthCheckDependencies(task)
+                  context.log.info(s"Task ${task.name} has ${expectedReplies} dependencies to be health checked")
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
+                  awaitHealthCheckReplies(itTasks, expectedReplies)
 
-      Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
-        message match {
-          case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
-            wrapped.response match {
-              case TaskResponseProtocol.TaskIsHealthy =>
-                context.log.info(s"Received TaskIsHealthy, left with $taskCount Task(s) to check")
+                case Some(task) if task.dependencies.isEmpty =>
+                  context.log.info(s"Task ${task.name} has no dependencies, moving to the next Task")
+                  context.self ! TaskManagerRequestProtocol.HealthCheckNextTask
+                  taskHealthCheck(itTasks)
 
-                val newTaskCount = taskCount - 1
-
-                if (newTaskCount <= 0) {
-                  timer.cancelAll()
-                  context.log.info("All Tasks are healthy")
+                case None =>
+                  context.log.info("All Tasks and their dependencies have been HealthChecked successfully")
                   replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = true)
                   manageRequests(taskResponseMapper, g, routers)
-                } else {
-                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
-                  tasksHealthChecking(taskResponseMapper, g, routers, newTaskCount, replyTo)
-                }
-            }
-
-          case TaskManagerRequestProtocol.HealthCheckTimeout =>
-            context.log.error("A HealthCheck Timeout has been received, as least one service is not healthy")
-            replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = false)
-            manageRequests(taskResponseMapper, g, routers)
+              }
+          }
         }
+
+      def awaitHealthCheckReplies(itTasks: Iterator[Task], expectedReplies: Int): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+        Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
+          message match {
+            case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
+              wrapped.response match {
+                case TaskResponseProtocol.TaskIsHealthy if expectedReplies <= 1 =>
+                  timer.cancelAll()
+                  context.log.info(s"Received TaskIsHealthy from a dependent Task, no more dependent Task to check")
+                  context.self ! TaskManagerRequestProtocol.HealthCheckNextTask
+                  taskHealthCheck(itTasks)
+
+                case TaskResponseProtocol.TaskIsHealthy =>
+                  val newExpectedReplies = expectedReplies - 1
+                  timer.startSingleTimer(TaskManagerRequestProtocol.HealthCheckTimeout, checkHealthTimeout)
+                  context.log.info(s"Received TaskIsHealthy from a dependent Task, left with $newExpectedReplies dependent Task(s) to check")
+                  awaitHealthCheckReplies(itTasks, newExpectedReplies)
+              }
+
+            case TaskManagerRequestProtocol.HealthCheckTimeout =>
+              context.log.error("A HealthCheck Timeout has been received, at least one service is not healthy")
+              replyTo ! TaskManagerResponseProtocol.HealthStatus(isHealthy = false)
+              manageRequests(taskResponseMapper, g, routers)
+          }
+        }
+
+      // Sends a CheckHealth request to each `dependent Task` of the provided Task, and returns the number of expected replies
+      def healthCheckDependencies(task: Task): Int = {
+        task
+          .dependencies
+          .flatMap(routers.get)
+          .foldLeft(0)((expectedReplies, router) => {
+            router ! TaskRequestProtocol.CheckHealth(taskResponseMapper)
+            expectedReplies + 1
+          })
+      }
+
+      // Looking for the entry point Task then starts the health check process from there down the Graph
+      g.nodes find (g having (node = _.value.isEntryPoint == true)) match {
+        case Some(node) =>
+          context.log.info("Health Check requested ...")
+          context.self ! TaskManagerRequestProtocol.HealthCheckNextTask
+          taskHealthCheck(g.outerNodeTraverser(node).map(_.value).iterator)
+
+        case None =>
+          context.log.error("No entry point Task found, cannot health check")
+          manageRequests(taskResponseMapper, g, routers)
       }
     }
-  }
 
   /**
    * Creates a graph for the provided service deployment
@@ -176,7 +198,7 @@ object TaskManagerActor {
 
     for {
       (service, idx) <- services.zipWithIndex
-    } yield g += Task(id = idx, name = service.serviceName, isEntryPoint = service.entryPoint, replicas = service.replicas)
+    } yield g += Task(idx, service.serviceName, service.entryPoint, service.replicas, service.dependencies)
 
     g
   }
@@ -186,7 +208,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @param g The Graph containing the Nodes for the services to deploy
    */
-  def createEdges(services: List[ServiceDeployment], g: Graph[Task, DiEdge]): Graph[Task, DiEdge] = {
+  def createEdges(services: List[ServiceDeployment], g: TaskGraph): Graph[Task, DiEdge] = {
     def nodeSelection(lookupNodeName: String)(node: g.NodeT): Boolean = node == lookupNodeName
 
     for {
@@ -208,13 +230,12 @@ object TaskManagerActor {
    * @param context An actor context
    * @return When successful it returns the provided Graph and a Map of Tasks and their ActorRef
    */
-  def spawnTasks(g: Graph[Task, DiEdge],
+  def spawnTasks(g: TaskGraph,
                  taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                  replyTo: ActorRef[TaskManagerResponseProtocol.Response])
                 (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] = {
     g.topologicalSort match {
       case Right(topology) =>
-        context.self ! TaskManagerRequestProtocol.SpawnNextTask
         spawnWithCheck(topology.toList.reverse.map(_.value), g, taskResponseMapper, replyTo)
 
       case Left(_) =>
@@ -233,14 +254,15 @@ object TaskManagerActor {
    * @return The next Behavior to switch to
    */
   def spawnWithCheck(tasks: List[Task],
-                     g: Graph[Task, DiEdge],
+                     g: TaskGraph,
                      taskResponseMapper: ActorRef[TaskResponseProtocol.Response],
                      replyTo: ActorRef[TaskManagerResponseProtocol.Response],
-                     routers: Map[String, ActorRef[TaskRequestProtocol.Request]] = Map()): Behavior[TaskManagerRequestProtocol.Request] =
+                     routers: TaskRouters = Map())
+                    (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.withTimers { timer =>
 
       def spawnNextTask(tasks: List[Task],
-                        routers: Map[String, ActorRef[TaskRequestProtocol.Request]]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+                        routers: TaskRouters): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
         Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
           message match {
             case TaskManagerRequestProtocol.SpawnNextTask =>
@@ -263,8 +285,8 @@ object TaskManagerActor {
 
       def awaitHealthCheckStatus(tasks: List[Task],
                                  task: Task,
-                                 router: ActorRef[TaskRequestProtocol.Request],
-                                 routers: Map[String, ActorRef[TaskRequestProtocol.Request]]): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
+                                 router: TaskRouter,
+                                 routers: TaskRouters): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
         Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
           message match {
             case wrapped: TaskManagerResponseProtocol.WrappedTaskResponse =>
@@ -289,6 +311,7 @@ object TaskManagerActor {
           }
         }
 
+      context.self ! TaskManagerRequestProtocol.SpawnNextTask
       spawnNextTask(tasks, routers)
     }
 
@@ -311,7 +334,7 @@ object TaskManagerActor {
    * @param routers A Map containing the ActorRef of each Task router
    * @param context An actor context
    */
-  def cleanUp(routers: Map[String, ActorRef[TaskRequestProtocol.Request]])
+  def cleanUp(routers: TaskRouters)
              (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Map[String, ActorRef[TaskRequestProtocol.Request]] = {
     context.log.info("Stopping all Tasks ...")
 
@@ -326,11 +349,11 @@ object TaskManagerActor {
   }
 
   /**
-   * Provides the topology of the Graph, this allows us to spawn the Tasks in the proper order based on their dependencies
+   * Provides the topology of the Graph, this allows us to check that a Graph is valid
    * @param g A Graph containing Nodes/Edges for the services to deploy
    * @return A list of Nodes (Tasks)
    */
-  def getTopology(g: Graph[Task, DiEdge]): Try[List[g.NodeT]] = {
+  def getTopology(g: TaskGraph): Try[List[g.NodeT]] = {
     g.topologicalSort match {
       case Right(topology) =>
         topology.toList match {
