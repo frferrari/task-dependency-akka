@@ -1,7 +1,7 @@
 package com.fferrari.actor
 
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors, Routers}
-import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy}
+import akka.actor.typed.{ActorRef, Behavior, SupervisorStrategy, Terminated}
 import com.fferrari.actor.protocol.TaskManagerResponseProtocol.WrappedTaskResponse
 import com.fferrari.actor.protocol.{TaskManagerRequestProtocol, TaskManagerResponseProtocol, TaskRequestProtocol, TaskResponseProtocol}
 import com.fferrari.model.ServiceDeployment
@@ -57,20 +57,18 @@ object TaskManagerActor {
                      routers: TaskRouters = Map()): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.receive { (context, message) =>
       message match {
+        case TaskManagerRequestProtocol.Deploy(services, replyTo) if routers.nonEmpty =>
+          context.log.info(s"Deploying ... Cleaning routers=$routers")
+          cleanUpAndWatch(routers)(context)
+
         case TaskManagerRequestProtocol.Deploy(services, replyTo) =>
-
-          // Stop any existing deployment
-          // val newRouters = cleanUp(routers)(context)
-          // Thread.sleep(3000) // TODO: Nobody wants to Thread.sleep, we should check for the Actors to be stopped
-          val newRouters = routers
-
           // Build the Service Deployment Graph
           buildServiceDeploymentGraph(services) match {
             case newGraph if newGraph.isCyclic =>
               // Reject the deployment request if the Graph is cyclic
               context.log.error("The service deployment is cyclic, stopping")
               replyTo ! TaskManagerResponseProtocol.DeploymentError
-              manageRequests(taskResponseMapper, newGraph, newRouters)
+              manageRequests(taskResponseMapper, newGraph, routers)
 
             case newGraph =>
               // If the Graph is acyclic then we can spawn the Tasks
@@ -185,7 +183,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @return The Graph of tasks for the provided service deployment
    */
-  def buildServiceDeploymentGraph(services: List[ServiceDeployment]): Graph[Task, DiEdge] =
+  def buildServiceDeploymentGraph(services: List[ServiceDeployment]): TaskGraph =
     createEdges(services, createNodes(services))
 
   /**
@@ -193,12 +191,13 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @return The Graph of Noddes
    */
-  def createNodes(services: List[ServiceDeployment]): Graph[Task, DiEdge] = {
-    val g = Graph.empty[Task, DiEdge]
+  def createNodes(services: List[ServiceDeployment]): TaskGraph = {
+    val g: TaskGraph = Graph()
 
     for {
       (service, idx) <- services.zipWithIndex
-    } yield g += Task(idx, service.serviceName, service.entryPoint, service.replicas, service.dependencies)
+      task = Task(idx, service.serviceName, service.entryPoint, service.replicas, service.dependencies)
+    } yield g += task
 
     g
   }
@@ -208,7 +207,7 @@ object TaskManagerActor {
    * @param services A list of services to deploy
    * @param g The Graph containing the Nodes for the services to deploy
    */
-  def createEdges(services: List[ServiceDeployment], g: TaskGraph): Graph[Task, DiEdge] = {
+  def createEdges(services: List[ServiceDeployment], g: TaskGraph): TaskGraph = {
     def nodeSelection(lookupNodeName: String)(node: g.NodeT): Boolean = node == lookupNodeName
 
     for {
@@ -260,7 +259,6 @@ object TaskManagerActor {
                      routers: TaskRouters = Map())
                     (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] =
     Behaviors.withTimers { timer =>
-
       def spawnNextTask(tasks: List[Task],
                         routers: TaskRouters): Behaviors.Receive[TaskManagerRequestProtocol.Request] =
         Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
@@ -326,7 +324,9 @@ object TaskManagerActor {
     context.log.info(s"Spawning task ${task.name} with ${replicas} replicas")
     val pool = Routers.pool(poolSize = replicas)(Behaviors.supervise(TaskActor()).onFailure[Exception](SupervisorStrategy.restart))
 
-    context.spawn(pool, task.name)
+    val ref = context.spawn(pool, task.name)
+    context.watch(ref)
+    ref
   }
 
   /**
@@ -335,18 +335,58 @@ object TaskManagerActor {
    * @param context An actor context
    */
   def cleanUp(routers: TaskRouters)
-             (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Map[String, ActorRef[TaskRequestProtocol.Request]] = {
+             (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): TaskRouters = {
     context.log.info("Stopping all Tasks ...")
 
     routers
       .foreach {
         case (taskName, route) =>
-          context.log.info(s"Stopping Task $route")
+          context.log.info(s"Stopping Task $taskName")
           route ! TaskRequestProtocol.Stop
       }
 
     Map.empty[String, ActorRef[TaskRequestProtocol.Request]]
   }
+
+  def cleanUpAndWatch(routers: TaskRouters)
+                     (implicit context: ActorContext[TaskManagerRequestProtocol.Request]): Behavior[TaskManagerRequestProtocol.Request] =
+    Behaviors.withTimers { timer =>
+      def cleanTasks(itRouters: Iterator[(String, TaskRouter)]): Behavior[TaskManagerRequestProtocol.Request] =
+        Behaviors.receive[TaskManagerRequestProtocol.Request] { (context, message) =>
+          message match {
+            case TaskManagerRequestProtocol.StopNextTask =>
+              itRouters.nextOption match {
+                case Some((taskName, router)) =>
+                  context.log.info(s"Stopping Task $taskName")
+                  timer.startSingleTimer(TaskManagerRequestProtocol.TaskTerminationTimeout, 10.seconds)
+                  // context.watch(router)
+                  router ! TaskRequestProtocol.Stop
+                  cleanTasks(itRouters)
+
+                case None =>
+                  timer.cancelAll()
+                  context.log.info(s"All Tasks have been stopped")
+                  Behaviors.same
+              }
+
+            case TaskManagerRequestProtocol.TaskTerminationTimeout =>
+              context.log.error("A Task has not terminated in the expected time range")
+              Behaviors.same
+          }
+        }.receiveSignal {
+          case (context, Terminated(ref)) =>
+            context.log.info(s"Received Terminated message from a Task, moving to the next Task")
+            context.self ! TaskManagerRequestProtocol.StopNextTask
+            cleanTasks(itRouters)
+
+          case signal =>
+            context.log.error(s"Unexpected signal received $signal")
+            cleanTasks(itRouters)
+        }
+
+      context.self ! TaskManagerRequestProtocol.StopNextTask
+      cleanTasks(routers.iterator)
+    }
 
   /**
    * Provides the topology of the Graph, this allows us to check that a Graph is valid

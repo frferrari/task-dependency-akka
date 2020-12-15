@@ -15,6 +15,7 @@ object TaskActor {
         Behaviors.same
 
       case TaskRequestProtocol.Stop =>
+        context.log.info(s"Handling Stop request for Task ${context.self.path}, stopping")
         Behaviors.stopped
     }
   }
